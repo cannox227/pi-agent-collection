@@ -1,0 +1,697 @@
+/**
+ * DonSeTch pi extension : bridges the donsetch MCP binary into pi.
+ *
+ * `pi install npm:donsetch` installs this package. At session_start the
+ * extension spawns `donsetch mcp`, performs the MCP handshake, discovers
+ * tools via tools/list, and registers each one natively with
+ * pi.registerTool(). Tool calls are proxied to the binary over stdio.
+ *
+ * Zero maintenance: tool definitions are fetched dynamically from the
+ * binary. When donsetch adds or changes tools, this extension picks
+ * them up automatically : no code changes needed here.
+ *
+ * Auto-download: if the binary is missing (e.g. postinstall was
+ * blocked by npm 10+), the extension resolves through
+ * resolve-binary.js at session_start: the package binary gets
+ * installed when possible, otherwise an existing donsetch
+ * (DONSETCH_BINARY / PATH / cargo bin) is used (#361: system-wide
+ * installs under a root-owned prefix).
+ *
+ * Custom TUI: each tool has clean renderCall/renderResult showing
+ * a compact summary card : not the full raw output. The LLM still
+ * receives complete content; the user sees a minimal status line +
+ * one-line preview. Amber theme matching DonSeTch's identity.
+ */
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
+import { spawn, execFileSync, type ChildProcess } from "node:child_process";
+import { existsSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { Text } from "@earendil-works/pi-tui";
+
+// ── Constants ──
+const INIT_TIMEOUT_MS = 30_000;
+const CALL_TIMEOUT_MS = 120_000;
+const SHUTDOWN_GRACE_MS = 2_000;
+
+// The client timeout must outlive the server's OWN budget, or a call the
+// binary still considers legal gets killed here first. web_crawl accepts
+// deadline_s up to 600 and web_fetch deadline_ms up to 600000, so a fixed
+// 120s client cap cut legal crawls off at exactly the binary's default
+// deadline (deadline_s defaults to 120 : the two raced). Derive it from
+// the call's own budget plus slack instead, capped at the largest budget
+// the schemas allow so a hostile arg cannot hold a slot forever.
+const CALL_DEADLINE_SLACK_MS = 20_000;
+const MAX_CALL_TIMEOUT_MS = 620_000; // 600s budget + slack
+
+function num(v: unknown): number | null {
+  const n = typeof v === "string" ? Number(v) : typeof v === "number" ? v : NaN;
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+function callTimeoutFor(name: string, args: any): number {
+  let budgetMs: number | null = null;
+  if (name === "web_crawl") {
+    const secs = num(args?.deadline_s);
+    budgetMs = secs !== null ? secs * 1000 : 120_000; // the binary's default
+  } else if (name === "web_fetch") {
+    budgetMs = num(args?.deadline_ms);
+  }
+  if (budgetMs === null) return CALL_TIMEOUT_MS;
+  return Math.min(budgetMs + CALL_DEADLINE_SLACK_MS, MAX_CALL_TIMEOUT_MS);
+}
+
+// A raw process.stderr.write bypasses pi's TUI paint cycle and
+// corrupts the viewport (worse across parallel agents). Gate it here.
+const DEBUG_MODE =
+  (process.env.DONSETCH_DEBUG ?? "").length > 0 ||
+  (process.env.DEBUG ?? "").length > 0;
+
+// ── TUI rendering note ──
+// Pi's TUI wraps tool calls in its own green (success) / red (failure)
+// highlight. We output PLAIN TEXT only : no ANSI codes at all.
+// pi-tui's truncateToWidth injects \x1b[0m RESET around the ellipsis,
+// which breaks pi's overlay mid-line. We use our own truncate()
+// that adds zero ANSI codes.
+
+/** Plain text truncation : no ANSI codes. */
+function truncate(text: string, maxLen: number): string {
+  if (text.length <= maxLen) return text;
+  if (maxLen <= 3) return text.slice(0, maxLen);
+  return text.slice(0, maxLen - 3) + "...";
+}
+
+// ── Tool icons ──
+const ICONS: Record<string, string> = {
+  web_fetch:  "\u{1F310}",  // 🌐
+  web_search: "\u{1F50E}",  // 🔎
+  web_crawl:  "\u{1F577}\u{FE0F}",  // 🕷️
+  web_screenshot: "\u{1F4F7}",  // 📷
+};
+
+// ── MCP client state ──
+let proc: ChildProcess | null = null;
+let nextId = 1;
+const pending = new Map<
+  number,
+  { resolve: (v: any) => void; reject: (e: any) => void; timer: ReturnType<typeof setTimeout> }
+>();
+let initialized = false;
+const toolNames: string[] = [];
+
+// ── Binary resolution ──
+
+function getBinaryPath(): string {
+  const pkgDir = __dirname;
+  const binaryName = process.platform === "win32" ? "donsetch.exe" : "donsetch";
+  return join(pkgDir, "binaries", binaryName);
+}
+
+function ensureBinary(): string {
+  const binaryPath = getBinaryPath();
+  if (existsSync(binaryPath)) return binaryPath;
+
+  const resolverScript = join(__dirname, "resolve-binary.js");
+  if (!existsSync(resolverScript)) {
+    throw new Error(
+      `donsetch binary not found at ${binaryPath} and resolve-binary.js is missing. ` +
+      `Run \`npm rebuild donsetch\` or \`npm install -g --allow-scripts=donsetch donsetch@latest\`.`
+    );
+  }
+
+  // The shared resolver installs the package binary when it can and
+  // falls back to an existing donsetch when it cannot. stdio is
+  // inherited so first-run download progress stays visible; the path
+  // arrives via a temp file because stdout belongs to the terminal.
+  const outFile = join(tmpdir(), `donsetch-resolve-${process.pid}.txt`);
+  try {
+    execFileSync(
+      process.execPath,
+      [resolverScript, "--print-file", outFile, "--pkg-dir", __dirname],
+      { stdio: "inherit", cwd: __dirname, timeout: 300_000 }
+    );
+    const resolved = readFileSync(outFile, "utf8").trim();
+    if (!resolved) throw new Error("resolver returned no binary path");
+    return resolved;
+  } catch (err: any) {
+    throw new Error(
+      `Failed to resolve the donsetch binary. The resolver output above names the cause and the ways out (${err.message}).`
+    );
+  } finally {
+    try { rmSync(outFile, { force: true }); } catch { /* best effort */ }
+  }
+}
+
+// ── MCP JSON-RPC 2.0 over stdio ──
+
+function startServer(): Promise<void> {
+  if (proc && initialized) return Promise.resolve();
+  if (proc && !initialized) return Promise.reject(new Error("donsetch MCP server is still initializing"));
+
+  return new Promise((resolve, reject) => {
+    let binaryPath: string;
+    try {
+      binaryPath = ensureBinary();
+    } catch (err: any) {
+      reject(err);
+      return;
+    }
+
+    try {
+      // --supervised: crash-only daemon. If the MCP server is SIGKILLed
+      // (OOM, crash), the supervisor respawns it and replays in-flight
+      // requests : pi users never see a dead tool until the process
+      // itself dies.
+      proc = spawn(binaryPath, ["mcp", "--supervised"], {
+        stdio: ["pipe", "pipe", "pipe"],
+        env: { ...process.env },
+        windowsHide: true,
+      });
+    } catch (err: any) {
+      reject(new Error(`Failed to spawn donsetch MCP server: ${err.message}`));
+      return;
+    }
+
+    let buffer = "";
+
+    proc.stdout?.on("data", (chunk: Buffer) => {
+      buffer += chunk.toString();
+      const lines = buffer.split("\n");
+      buffer = lines.pop() || "";
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        try {
+          const msg = JSON.parse(line);
+          if (msg.id != null && pending.has(msg.id)) {
+            const entry = pending.get(msg.id)!;
+            pending.delete(msg.id);
+            clearTimeout(entry.timer);
+            if (msg.error) {
+              entry.reject(new Error(msg.error.message || "MCP error"));
+            } else {
+              entry.resolve(msg.result);
+            }
+          }
+        } catch {
+          /* ignore non-JSON lines on stdout */
+        }
+      }
+    });
+
+    // The daemon writes diagnostics to stderr (Xvfb warnings,
+    // fallback notices, ghost telemetry). Pi's TUI surfaces stderr
+    // as user-facing output: raw forwarding used to pop non-fatal
+    // warnings up (issue #95). Gate it:
+    // - DONSETCH_DEBUG / DEBUG set: forward everything (dev mode)
+    // - otherwise only crash/fatal lines survive; the rest is
+    //   tool-level information the caller already has
+    const FATAL_RE = /fatal|panic|crash|SIGSEGV|abort|OOM|out of memory/i;
+    let stderrTail = "";
+    proc.stderr?.on("data", (chunk: Buffer) => {
+      if (DEBUG_MODE) {
+        process.stderr.write(chunk);
+        return;
+      }
+      stderrTail = (stderrTail + chunk.toString()).slice(-2048);
+      const lines = stderrTail.split("\n");
+      stderrTail = lines.pop() || "";
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (trimmed && FATAL_RE.test(trimmed)) {
+          process.stderr.write(`[donsetch] ${trimmed}\n`);
+        }
+      }
+    });
+
+    proc.on("error", (err) => {
+      proc = null;
+      initialized = false;
+      for (const [, e] of pending) {
+        clearTimeout(e.timer);
+        e.reject(err);
+      }
+      pending.clear();
+    });
+
+    proc.on("exit", (code) => {
+      proc = null;
+      initialized = false;
+      for (const [, e] of pending) {
+        clearTimeout(e.timer);
+        e.reject(new Error(`donsetch MCP server exited (code ${code})`));
+      }
+      pending.clear();
+    });
+
+    // A write to a server that just died sinks into the stream and
+    // comes back as an async 'error' event (EPIPE/ECONNRESET). With
+    // no listener Node escalates it to an uncaughtException, killing
+    // the whole pi process, the "write EPIPE" crash. Handling it like
+    // an unexpected exit keeps pi alive and fails the request cleanly.
+    const onStreamError = (err: NodeJS.ErrnoException) => {
+      proc = null;
+      initialized = false;
+      for (const [, e] of pending) {
+        clearTimeout(e.timer);
+        e.reject(new Error(`donsetch MCP server stream error: ${err.code || err.message}`));
+      }
+      pending.clear();
+    };
+    proc.stdin?.on("error", onStreamError);
+    proc.stdout?.on("error", onStreamError);
+    proc.stderr?.on("error", onStreamError);
+
+    sendRequest(
+      "initialize",
+      {
+        protocolVersion: "2024-11-05",
+        capabilities: {},
+        clientInfo: { name: "pi-donsetch", version: "1.0.0" },
+      },
+      INIT_TIMEOUT_MS
+    )
+      .then(() => {
+        sendNotification("notifications/initialized", {});
+        initialized = true;
+        resolve();
+      })
+      .catch(reject);
+  });
+}
+
+function sendRequest(
+  method: string,
+  params: any,
+  timeoutMs = CALL_TIMEOUT_MS,
+  signal?: AbortSignal
+): Promise<any> {
+  return new Promise((resolve, reject) => {
+    if (!proc?.stdin?.writable) {
+      reject(new Error("donsetch MCP server not running"));
+      return;
+    }
+    const id = nextId++;
+    let settled = false;
+    const finish = (fn: (v: any) => void, v: any) => {
+      if (settled) return;
+      settled = true;
+      signal?.removeEventListener("abort", onAbort);
+      fn(v);
+    };
+    const timer = setTimeout(() => {
+      if (pending.delete(id)) {
+        finish(reject, new Error(`MCP request timeout (${timeoutMs}ms): ${method}`));
+      }
+    }, timeoutMs);
+    // v3 real MCP cancellation: forward pi's abort to the server so the
+    // in-flight fetch/crawl actually stops server-side, then settle
+    // locally. The caller maps this to a graceful "Cancelled" result.
+    const onAbort = () => {
+      if (pending.delete(id)) {
+        clearTimeout(timer);
+        sendNotification("notifications/cancelled", { id, reason: "client aborted" });
+        finish(reject, new Error("cancelled"));
+      }
+    };
+    if (signal) {
+      if (signal.aborted) {
+        onAbort();
+        return;
+      }
+      signal.addEventListener("abort", onAbort, { once: true });
+    }
+    pending.set(id, {
+      resolve: (v: any) => {
+        clearTimeout(timer);
+        finish(resolve, v);
+      },
+      reject: (e: any) => {
+        clearTimeout(timer);
+        finish(reject, e);
+      },
+      timer,
+    });
+    const msg = JSON.stringify({ jsonrpc: "2.0", id, method, params });
+    proc.stdin.write(msg + "\n");
+  });
+}
+
+function sendNotification(method: string, params: any): void {
+  if (!proc?.stdin?.writable) return;
+  const msg = JSON.stringify({ jsonrpc: "2.0", method, params });
+  try {
+    proc.stdin.write(msg + "\n");
+  } catch {
+    // Stream error handler covers the async EPIPE; nothing to do here.
+  }
+}
+
+async function callMcpTool(
+  name: string,
+  args: any,
+  signal?: AbortSignal,
+  timeoutMs = CALL_TIMEOUT_MS
+): Promise<any> {
+  return sendRequest("tools/call", { name, arguments: args ?? {} }, timeoutMs, signal);
+}
+
+function killServer(): void {
+  if (proc) {
+    try {
+      proc.stdin?.end();
+      proc.kill("SIGTERM");
+      const p = proc;
+      setTimeout(() => {
+        try { p.kill("SIGKILL"); } catch {}
+      }, SHUTDOWN_GRACE_MS);
+    } catch {}
+    proc = null;
+  }
+  initialized = false;
+  toolNames.length = 0;
+  for (const [, e] of pending) {
+    clearTimeout(e.timer);
+    e.reject(new Error("donsetch MCP server killed"));
+  }
+  pending.clear();
+}
+
+function isAlive(): boolean {
+  return proc !== null && !proc.killed && proc.stdin?.writable === true;
+}
+
+// ── TUI helpers ──
+
+/** Extract a clean preview line from markdown content. */
+function getPreview(text: string, maxLen = 72): string {
+  const lines = text.split("\n");
+  for (const line of lines) {
+    let clean = line.replace(/^#+\s*/, "").replace(/\*\*([^*]+)\*\*/g, "$1").trim();
+    if (clean.length > 0 && !clean.startsWith("{") && !clean.startsWith("[")) {
+      return truncate(clean, maxLen);
+    }
+  }
+  return "";
+}
+
+/** Parse the server's folded state block: a leading "[meta] {json}". */
+function parseFoldedMeta(blocks: string[]): any {
+  for (const b of blocks) {
+    if (!b.startsWith("[meta] ")) continue;
+    try {
+      return JSON.parse(b.slice("[meta] ".length).trim());
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+/** Count numbered search results in text. */
+function countSearchResults(text: string): number {
+  const matches = text.match(/^\d+\.\s/gm);
+  return matches ? matches.length : 0;
+}
+
+/** Extract first search result title. */
+function getFirstResultTitle(text: string): string {
+  const match = text.match(/^\d+\.\s+\*\*(.+?)\*\*/m);
+  return match ? match[1] : "";
+}
+
+/** Count pages from crawl output (## headings or numbered pages). */
+function countCrawlPages(text: string): number {
+  const matches = text.match(/^##\s/gm);
+  return matches ? matches.length : 0;
+}
+
+/** Extract domain from URL for display. */
+function shortUrl(url: string): string {
+  try {
+    const u = new URL(url);
+    return u.hostname + (u.pathname !== "/" ? u.pathname.slice(0, 30) : "");
+  } catch {
+    return truncate(url, 50);
+  }
+}
+
+/**
+ * Extract the search provider from structuredContent.
+ * Returns "local" when provider is null/undefined (local keyless
+ * engine), or the provider name ("exa", "tavily", "serper",
+ * "tinyfish") for BYOK.
+ */
+function getSearchProvider(sc: any, dbg: any): string {
+  const provider = (sc && sc.provider) || (dbg && dbg.provider) || null;
+  if (!provider || provider === "null") return "local";
+  return String(provider);
+}
+
+/**
+ * Extract the fetch source label from model state with a
+ * client-only diagnostics fallback. Compact MCP contracts keep
+ * transport telemetry in _meta["com.donsetch/fetch-debug"], so the
+ * tier can live there; older servers still expose it on
+ * structuredContent.
+ * Returns "cache" when tier is "1(warm)" (warm cookies, not a
+ * fresh fetch), "ghost" when tier starts with "2" (browser
+ * escalation), or "" for a normal tier-1 fetch.
+ */
+function getFetchSource(sc: any, dbg: any): string {
+  const tier = String(
+    (sc && sc.tier) || (dbg && dbg.tier) || ""
+  );
+  if (tier.includes("warm")) return "cache";
+  if (tier.startsWith("2")) return "ghost";
+  return "";
+}
+
+/**
+ * Extract the fetch verdict/content status from structuredContent.
+ * Returns "blocked" when content_ok is false or verdict is not
+ * ContentOk, "" otherwise.
+ */
+function getFetchStatus(sc: any): string {
+  if (!sc) return "";
+  if (sc.content_ok === false) return "blocked";
+  if (sc.thin === true) return "thin";
+  return "";
+}
+
+// ── Extension ──
+
+export default function (pi: ExtensionAPI) {
+  pi.on("session_start", async () => {
+    try {
+      await startServer();
+    } catch (err: any) {
+      const message = String(err.message || err);
+      const hint = message.includes("initialize") && message.includes("timeout")
+        ? " Run `donsetch doctor` to diagnose the installation and runtime."
+        : "";
+      process.stderr.write(`[donsetch] failed to start MCP server: ${message}.${hint}\n`);
+      return;
+    }
+
+    let toolsResult: any;
+    try {
+      toolsResult = await sendRequest("tools/list", {});
+    } catch (err: any) {
+      process.stderr.write(`[donsetch] failed to list tools: ${err.message}\n`);
+      return;
+    }
+
+    const mcpTools: any[] = toolsResult?.tools ?? [];
+    if (mcpTools.length === 0) {
+      process.stderr.write("[donsetch] no tools discovered from MCP server\n");
+      return;
+    }
+
+    for (const mcpTool of mcpTools) {
+      const name = mcpTool.name;
+      if (!name) continue;
+      toolNames.push(name);
+
+      const description = mcpTool.description || mcpTool.name;
+      const inputSchema = mcpTool.inputSchema || { type: "object", properties: {} };
+      const toolName = name;
+      const icon = ICONS[toolName] ?? "\u25C6";
+
+      pi.registerTool({
+        name: toolName,
+        label: toolName,
+        description,
+        parameters: Type.Unsafe(inputSchema) as any,
+        async execute(_toolCallId, params, _signal) {
+          if (!isAlive()) {
+            try {
+              await startServer();
+            } catch (err: any) {
+              return {
+                content: [{ type: "text", text: `donsetch MCP server crashed and could not restart: ${err.message}` }],
+                // Every other result path carries `details`; pi's
+                // AgentToolResult requires it, and renderResult reads it.
+                details: { mcpTool: toolName, isError: true, error: err.message },
+                isError: true,
+              };
+            }
+          }
+
+          try {
+            const result = await callMcpTool(
+              toolName,
+              params,
+              _signal,
+              callTimeoutFor(toolName, params)
+            );
+            // Every content block, joined verbatim: this is exactly
+            // what pi hands the model. The server folds state into a
+            // leading [meta] block for the clients whose model sees
+            // only `content` (pi among them), and that block carries
+            // the result URLs behind the S handles, next_offset and
+            // error codes, so it must not be dropped here. The detail
+            // helpers below skip meta-shaped lines where they look
+            // for prose.
+            const blocks = (result?.content ?? []).map((b: any) => b?.text ?? "");
+            const text = blocks.join("") || "";
+            const isErr = result?.isError ?? false;
+            // Folded sessions omit structuredContent; when it is
+            // absent, recover the same state from the [meta] block so
+            // the TUI badge readers (blocked / thin / source) keep
+            // working.
+            const sc = result?.structuredContent ?? parseFoldedMeta(blocks);
+            const dbg = result?._meta?.["com.donsetch/fetch-debug"] ?? null;
+            // Issue #172: provider moved to _meta for compact search
+            // responses, so the BYOK label must read the telemetry
+            // object too instead of blaming "local" on every search.
+            const sdbg = result?._meta?.["com.donsetch/search-debug"] ?? null;
+
+            // Build details for TUI rendering
+            const details: any = {
+              mcpTool: toolName,
+              isError: isErr,
+              chars: text.length,
+            };
+
+            if (toolName === "web_search") {
+              details.results = countSearchResults(text);
+              details.topResult = getFirstResultTitle(text);
+              details.provider = getSearchProvider(sc, sdbg);
+            } else if (toolName === "web_fetch") {
+              details.source = getFetchSource(sc, dbg);
+              details.status = getFetchStatus(sc);
+              if (sc?.stitched) details.stitched = sc.stitched;
+            } else if (toolName === "web_crawl") {
+              details.pages = countCrawlPages(text);
+            }
+
+            // For errors, extract error text + v3 stable error code
+            if (isErr) {
+              details.error = getPreview(text, 60);
+              if (sc?.code) details.code = sc.code;
+            } else {
+              details.preview = getPreview(text);
+            }
+
+            return {
+              content: result?.content ?? [{ type: "text", text: "No output" }],
+              details,
+              isError: isErr,
+            };
+          } catch (err: any) {
+            // User pressed Esc in pi: we already told the server to stop
+            // (notifications/cancelled). Graceful non-error result, per
+            // pi's extension contract for aborted calls.
+            if (err.message === "cancelled") {
+              return {
+                content: [{ type: "text", text: "Cancelled" }],
+                details: { mcpTool: toolName, cancelled: true },
+              };
+            }
+            return {
+              content: [{ type: "text", text: `donsetch MCP call failed: ${err.message}` }],
+              details: { mcpTool: toolName, isError: true, error: err.message },
+              isError: true,
+            };
+          }
+        },
+
+        renderCall(args: any, _theme: any) {
+          let key = "";
+          if (args?.url) {
+            key = shortUrl(args.url);
+          } else if (args?.query) {
+            key = truncate(`"${args.query}"`, 50);
+          }
+          // Plain text only : no ANSI codes. Pi wraps tool calls
+          // in its own green (success) / red (failure) highlight.
+          // Any ANSI we emit breaks pi's overlay mid-line.
+          return new Text(
+            `${icon} ${toolName}  ${key}`,
+            0, 0
+          );
+        },
+
+        renderResult(result: any, opts: any, _theme: any) {
+          if (opts?.isPartial) {
+            return new Text(`${toolName} working…`, 0, 0);
+          }
+
+          const isErr = result?.isError || result?.details?.isError;
+          const d = result?.details ?? {};
+
+          // Build metadata string per tool
+          let meta = "";
+          if (toolName === "web_fetch") {
+            const parts: string[] = [];
+            parts.push(`${(d.chars ?? 0).toLocaleString()} chars`);
+            if (d.source === "cache") parts.push("via cache");
+            else if (d.source === "ghost") parts.push("via ghost");
+            if (d.status === "blocked") parts.push("blocked");
+            else if (d.status === "thin") parts.push("thin");
+            if (d.stitched) parts.push(`stitched \u00D7${d.stitched}`);
+            meta = parts.join(" \u00B7 ");
+          } else if (toolName === "web_search") {
+            const count = d.results ?? 0;
+            const provider = d.provider ?? "local";
+            meta = `${count} result${count !== 1 ? "s" : ""} \u00B7 via ${provider}`;
+          } else if (toolName === "web_crawl") {
+            const pages = d.pages ?? 0;
+            meta = `${pages} page${pages !== 1 ? "s" : ""}`;
+          }
+
+          // Build line 2: preview or error
+          let line2 = "";
+          if (d.cancelled) {
+            line2 = "cancelled";
+          } else if (isErr) {
+            line2 = d.code ? `[${d.code}] ${d.error || "failed"}` : d.error || "failed";
+          } else if (toolName === "web_search" && d.topResult) {
+            line2 = truncate(d.topResult, 70);
+          } else if (d.preview) {
+            line2 = d.preview;
+          }
+
+          // Plain text only : no ANSI. Pi handles all coloring.
+          const line1 = `${toolName} \u00B7 ${meta}`;
+          const output = line2
+            ? `${line1}\n  ${line2}`
+            : line1;
+
+          return new Text(output, 0, 0);
+        },
+      });
+    }
+
+    // Fires every session_start (unlike the failure paths above), so
+    // this one corrupted the viewport on every normal run.
+    if (DEBUG_MODE) {
+      process.stderr.write(`[donsetch] ${mcpTools.length} tools registered: ${toolNames.join(", ")}\n`);
+    }
+  });
+
+  pi.on("session_shutdown", () => {
+    killServer();
+  });
+}

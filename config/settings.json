@@ -1,0 +1,13 @@
+{
+  "defaultProvider": "openai",
+  "defaultModel": "gpt-6-luna",
+  "defaultThinkingLevel": "medium",
+  "hideThinkingBlock": true,
+  "theme": "catppuccin-macchiato",
+  "compaction": {
+    "enabled": true
+  },
+  "retry": {
+    "enabled": true
+  }
+}

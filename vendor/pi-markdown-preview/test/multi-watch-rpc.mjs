@@ -1,0 +1,365 @@
+import assert from "node:assert/strict";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
+import { spawn, spawnSync } from "node:child_process";
+import { chmod, mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+
+if (process.platform === "win32") {
+	console.log("Multi-watch RPC lifecycle check is skipped on Windows; parser and path-identity regressions still run.");
+	process.exit(0);
+}
+
+const repo = resolve(process.env.PI_MARKDOWN_PREVIEW_TEST_PACKAGE_DIR || join(dirname(fileURLToPath(import.meta.url)), ".."));
+const root = await realpath(await mkdtemp(join(tmpdir(), "pi-markdown-preview-multi-watch-")));
+const bin = join(root, "bin");
+const openLog = join(root, "open.log");
+const fakeCmuxPath = join(bin, "cmux");
+const fakePandocPath = join(bin, "pandoc");
+const pandocDelayFile = join(root, "delay-pandoc");
+const realPandocPath = process.env.PANDOC_PATH?.trim()
+	|| spawnSync("sh", ["-c", "command -v pandoc"], { encoding: "utf8" }).stdout.trim();
+assert.ok(realPandocPath, "Pandoc is required for multi-watch integration checks.");
+await mkdir(bin);
+await writeFile(fakeCmuxPath, '#!/bin/sh\nprintf "%s\\n" "$3" >> "$PMP_OPEN_LOG"\n');
+await writeFile(fakePandocPath, '#!/bin/sh\n[ -f "$PMP_PANDOC_DELAY_FILE" ] && sleep 0.6\nexec "$PMP_REAL_PANDOC" "$@"\n');
+await chmod(fakeCmuxPath, 0o755);
+await chmod(fakePandocPath, 0o755);
+await writeFile(openLog, "");
+
+const one = join(root, "one.md");
+const two = join(root, "two.md");
+await mkdir(join(root, "docs"));
+const report = join(root, "docs", "linked report.md");
+await writeFile(report, "# Linked report\n\n## Details\n\n[Code](example.py)\n\n![Figure](figure.svg)\n");
+await writeFile(join(root, "docs", "example.py"), "print('nested code')\n");
+await writeFile(join(root, "docs", "figure.svg"), '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"></svg>');
+await writeFile(join(root, "too-large.md"), "x".repeat(2 * 1024 * 1024 + 1));
+await writeFile(join(root, "binary.txt"), Buffer.from([0, 1, 2]));
+await writeFile(one, "# One\n\nVersion one\n\n[Report](<docs/linked report.md#details>)\n\n[Large](too-large.md) [Binary](binary.txt)\n");
+await writeFile(two, "# Two\n\nIndependent\n");
+// Seed a real assistant response without calling a model or using user logs.
+const session = SessionManager.create(root, join(root, "sessions"));
+// An earlier finished exchange: response watchers seed it as history.
+session.appendMessage({ role: "user", content: "Earlier question", timestamp: Date.now() - 60_000 });
+session.appendMessage({ role: "assistant", content: [{ type: "text", text: "Earlier finished answer" }], api: "openai-responses", provider: "openai", model: "test-fixture", stopReason: "stop", timestamp: Date.now() - 59_000,
+	usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } });
+session.appendMessage({ role: "user", content: "Show the report", timestamp: Date.now() });
+const recordedImage = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aT1kAAAAASUVORK5CYII=";
+const fixtureUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
+session.appendMessage({ role: "assistant", content: [{ type: "toolCall", id: "synthetic-image", name: "read", arguments: { path: "/never-read/synthetic.png" } }], api: "openai-responses", provider: "openai", model: "test-fixture", stopReason: "toolUse", timestamp: Date.now(), usage: fixtureUsage });
+session.appendMessage({ role: "toolResult", toolCallId: "synthetic-image", toolName: "read", content: [{ type: "image", mimeType: "image/png", data: recordedImage }], isError: false, timestamp: Date.now() });
+session.appendMessage({
+	role: "assistant", content: [{ type: "text", text: `[Absolute report](<${report}#details>)\n\n[Relative report](<docs/linked report.md>)` }],
+	api: "openai-responses", provider: "openai", model: "test-fixture", stopReason: "stop", timestamp: Date.now(),
+	usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+});
+
+// Isolate settings/auth and strip provider secrets. These commands must never
+// reach a real model, even if a broken extension fails to register a command.
+const inherited = Object.fromEntries(Object.entries(process.env).filter(([name]) => !/(?:API_KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|^AWS_|^MUXY_|^HERDR_)/i.test(name)));
+const env = {
+	...inherited,
+	HOME: root,
+	PI_CODING_AGENT_DIR: join(root, "agent"),
+	PI_OFFLINE: "1",
+	PI_SKIP_VERSION_CHECK: "1",
+	CMUX_BUNDLED_CLI_PATH: fakeCmuxPath,
+	CMUX_WORKSPACE_ID: "multi-watch-test-workspace",
+	PANDOC_PATH: fakePandocPath,
+	PI_MARKDOWN_PREVIEW_REGISTER_EXPORT_TOOL: "0",
+	PMP_OPEN_LOG: openLog,
+	PMP_PANDOC_DELAY_FILE: pandocDelayFile,
+	PMP_REAL_PANDOC: realPandocPath,
+};
+const piCommand = process.env.PI_MARKDOWN_PREVIEW_TEST_PI_COMMAND || join(repo, "node_modules", ".bin", "pi");
+const child = spawn(piCommand, [
+	"--mode", "rpc",
+	"--session", session.getSessionFile(),
+	"--no-extensions",
+	"--no-skills",
+	"--no-prompt-templates",
+	"--no-context-files",
+	"--extension", join(repo, "index.ts"),
+], { cwd: root, env, stdio: ["pipe", "pipe", "pipe"] });
+
+let stdoutBuffer = "";
+let stderr = "";
+const responses = new Map();
+const waiters = new Map();
+const notifications = [];
+child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
+child.stdout.on("data", (chunk) => {
+	stdoutBuffer += chunk.toString();
+	for (;;) {
+		const newlineIndex = stdoutBuffer.indexOf("\n");
+		if (newlineIndex < 0) break;
+		const line = stdoutBuffer.slice(0, newlineIndex);
+		stdoutBuffer = stdoutBuffer.slice(newlineIndex + 1);
+		if (!line) continue;
+		const event = JSON.parse(line);
+		if (event.type === "extension_ui_request" && event.method === "notify") notifications.push(event);
+		if (event.type === "response" && event.id) {
+			responses.set(event.id, event);
+			waiters.get(event.id)?.(event);
+			waiters.delete(event.id);
+		}
+	}
+});
+
+let commandSequence = 0;
+const waitResponse = (id) => responses.has(id)
+	? Promise.resolve(responses.get(id))
+	: new Promise((resolvePromise, rejectPromise) => {
+		const timeout = setTimeout(() => {
+			waiters.delete(id);
+			rejectPromise(new Error(`Timed out waiting for ${id}\n${stderr}`));
+		}, 30_000);
+		waiters.set(id, (event) => {
+			clearTimeout(timeout);
+			resolvePromise(event);
+		});
+	});
+const sendCommand = (message) => {
+	const id = `command-${++commandSequence}`;
+	child.stdin.write(`${JSON.stringify({ id, type: "prompt", message })}\n`);
+	return waitResponse(id).then((response) => {
+		assert.equal(response.success, true, `${message}: ${JSON.stringify(response)}`);
+	});
+};
+const command = async (message) => await sendCommand(message);
+const waitFor = async (predicate, label, timeoutMs = 10_000) => {
+	const started = Date.now();
+	while (Date.now() - started < timeoutMs) {
+		const value = await predicate();
+		if (value) return value;
+		await new Promise((resolvePromise) => setTimeout(resolvePromise, 50));
+	}
+	throw new Error(`Timed out waiting for ${label}`);
+};
+const openedUrls = async () => (await readFile(openLog, "utf8")).trim().split("\n").filter(Boolean);
+const waitOpenCount = (count) => waitFor(async () => {
+	const urls = await openedUrls();
+	return urls.length >= count ? urls : undefined;
+}, `${count} browser opens`);
+const bootstrap = async (url) => {
+	const response = await fetch(url);
+	assert.equal(response.status, 200);
+	const cookie = (response.headers.get("set-cookie") ?? "").split(";", 1)[0];
+	assert.ok(cookie);
+	return { origin: new URL(url).origin, cookie, html: await response.text() };
+};
+const getPage = async (session) => {
+	const response = await fetch(session.origin, { headers: { cookie: session.cookie } });
+	assert.equal(response.status, 200);
+	return await response.text();
+};
+const revisionOf = (html) => Number(/const revision = "(\d+)";/.exec(html)?.[1]);
+const isClosed = async (session) => {
+	try {
+		await fetch(session.origin, { headers: { cookie: session.cookie } });
+		return false;
+	} catch {
+		return true;
+	}
+};
+
+try {
+	await command(`/preview-browser -w --file ${JSON.stringify(one)}`);
+	let urls = await waitOpenCount(1);
+	const oneSession = await bootstrap(urls[0]);
+	assert.match(oneSession.html, /<title>one\.md — Markdown Preview<\/title>/);
+	assert.match(oneSession.html, /PiMarkdownPreviewReadingPosition\.install/, "Real file-watch commands should enable reading-position preservation.");
+	assert.match(oneSession.html, /data-watch-control="source"[^>]*>one\.md<\/span>/);
+	const documentLinks = page => [...page.matchAll(/<a\b[^>]*href="(\/__pi_markdown_preview_document__\/[^ "]+)"/g)].map(match => match[1].replaceAll("&amp;", "&"));
+	const linkedPage = async (watch, link) => {
+		const response = await fetch(new URL(link, watch.origin), { headers: { cookie: watch.cookie } });
+		assert.equal(response.status, 200);
+		return await response.text();
+	};
+	const fileLinks = documentLinks(oneSession.html);
+	assert.equal(fileLinks.length, 3, "real file watch must rewrite supported document links");
+	assert.equal(new URL(fileLinks[0], oneSession.origin).hash, "#details");
+	const linked = await linkedPage(oneSession, fileLinks[0]);
+	assert.ok(linked.includes('<h1 id="linked-report">Linked report</h1>'));
+	assert.ok(linked.includes("--preview-font-size: 15px"));
+	assert.ok((await linkedPage(oneSession, documentLinks(linked)[0])).includes("nested code"));
+	const image = /<img\b[^>]*src="([^"]+)"/.exec(linked)[1];
+	assert.equal((await fetch(new URL(image, oneSession.origin), { headers: { cookie: oneSession.cookie } })).status, 200);
+	assert.equal((await fetch(new URL(fileLinks[0], oneSession.origin))).status, 403);
+	for (const [index, status] of [[1, 413], [2, 415]]) assert.equal((await fetch(new URL(fileLinks[index], oneSession.origin), { headers: { cookie: oneSession.cookie } })).status, status);
+
+	await command(`/preview-browser -w --file ${JSON.stringify(two)}`);
+	urls = await waitOpenCount(2);
+	const twoSession = await bootstrap(urls[1]);
+	assert.notEqual(oneSession.origin, twoSession.origin);
+
+	await command(`/preview-browser -w --font-size 18 --file ${JSON.stringify(one)}`);
+	urls = await waitOpenCount(3);
+	assert.equal(new URL(urls[2]).origin, oneSession.origin, "The same file should reopen its existing server.");
+	assert.ok((await linkedPage(oneSession, fileLinks[0])).includes("--preview-font-size: 18px"), "linked previews use the watcher's current font size");
+
+	const oneAlias = join(root, "one-alias.md");
+	await symlink(one, oneAlias);
+	await command(`/preview-browser -w --file ${JSON.stringify(oneAlias)}`);
+	urls = await waitOpenCount(4);
+	assert.equal(new URL(urls[3]).origin, oneSession.origin, "A symlink alias should reopen the canonical watcher.");
+
+	await command("/preview-browser -w --font-size 19");
+	urls = await waitOpenCount(5);
+	const responseSession = await bootstrap(urls[4]);
+	assert.match(responseSession.html, /<title>Assistant responses — Markdown Preview<\/title>/);
+	assert.doesNotMatch(responseSession.html, /<a\b[^>]*data-watch-control="turn-details"/);
+	const responseRevision = revisionOf(responseSession.html);
+	assert.equal(responseRevision, 2, "The latest response follows one seeded earlier response.");
+	assert.match(responseSession.html, /data-watch-control="count"[^>]*>2\/2</);
+	const seededPage = await fetch(new URL("/?revision=1", responseSession.origin), { headers: { cookie: responseSession.cookie } });
+	assert.match(await seededPage.text(), /Earlier finished answer/, "The seeded history holds the earlier finished response.");
+	assert.ok(notifications.some(e => e.message?.includes("Tip: start with /preview-browser --watch --working to see prompts and activity.")), "A response watcher without Working suggests --working.");
+	const beforeDetailsUpgrade = notifications.length;
+	await command("/preview-browser -w --working");
+	assert.ok(notifications.slice(beforeDetailsUpgrade).some(e => e.notifyType === "error" && e.message.includes("fresh private preview link")), "Do not upgrade an already-shared preview to expose traces.");
+	assert.match(responseSession.html, new RegExp(`const positionScope = "[^"]+:revision:${responseRevision}"`), "Response-watch commands must scope Back restoration to their current revision.");
+	assert.equal(new Set([oneSession.origin, twoSession.origin, responseSession.origin]).size, 3);
+	const responseLinks = documentLinks(responseSession.html);
+	assert.equal(responseLinks.length, 2, "real response watch must rewrite absolute and relative links");
+	assert.equal(new URL(responseLinks[0], responseSession.origin).pathname, new URL(responseLinks[1], responseSession.origin).pathname);
+	assert.ok((await linkedPage(responseSession, responseLinks[0])).includes("--preview-font-size: 19px"));
+
+	const beforeList = notifications.length;
+	await command("/preview-browser --list");
+	const listNotice = notifications.slice(beforeList).find((event) => event.message.includes("Browser preview watchers"));
+	assert.match(listNotice?.message ?? "", /Browser preview watchers \(3\/8\)/);
+	assert.match(listNotice?.message ?? "", /assistant responses/);
+	assert.ok(listNotice?.message.includes(one));
+
+	const beforeEditRevision = revisionOf(await getPage(oneSession));
+	await writeFile(one, "# One\n\nVersion two\n");
+	const oneUpdated = await waitFor(async () => {
+		const html = await getPage(oneSession);
+		return revisionOf(html) > beforeEditRevision && html.includes("Version two") ? html : undefined;
+	}, "first file update");
+	assert.equal(revisionOf(oneUpdated), beforeEditRevision + 1);
+	assert.equal(revisionOf(await getPage(twoSession)), 1, "The second file must not change with the first.");
+	assert.equal(revisionOf(await getPage(responseSession)), responseRevision, "The response watcher must not change with a file.");
+
+	await command(`/preview-browser --stop --file ${JSON.stringify(oneAlias)}`);
+	assert.equal(await waitFor(() => isClosed(oneSession), "first watcher shutdown"), true);
+	assert.equal(revisionOf(await getPage(twoSession)), 1);
+
+	const beforeAmbiguousStop = notifications.length;
+	await command("/preview-browser --stop");
+	const ambiguousNotice = notifications.slice(beforeAmbiguousStop).find((event) => event.notifyType === "error");
+	assert.ok(ambiguousNotice?.message.includes("Choose a file path, --responses, or --all"));
+	assert.equal(revisionOf(await getPage(twoSession)), 1, "Ambiguous stop must not change another watcher.");
+
+	await command("/preview-browser --stop --responses");
+	assert.equal(await waitFor(() => isClosed(responseSession), "response watcher shutdown"), true);
+	await command("/preview-browser --stop");
+	assert.equal(await waitFor(() => isClosed(twoSession), "bare unambiguous shutdown"), true);
+
+	const opensBeforeDetails = (await openedUrls()).length;
+	const notesBeforeDetails = notifications.length;
+	await command("/preview-browser -w --turn-details"); // hidden 0.21.x alias of --working
+	const detailUrls = await waitOpenCount(opensBeforeDetails + 1);
+	const detailSession = await bootstrap(detailUrls.at(-1));
+	const detailLink = detailSession.html.match(/data-watch-control="turn-details" href="([^"]+)"/)?.[1].replaceAll("&amp;", "&");
+	assert.ok(detailLink, "Real Pi response watchers should expose the opted-in details link.");
+	assert.ok(notifications.slice(notesBeforeDetails).some(e => e.message?.includes("Working includes potentially sensitive")) && !notifications.slice(notesBeforeDetails).some(e => e.message?.includes("Tip:")), "Working watchers warn instead of showing the tip.");
+	const detailPage = await fetch(new URL(detailLink, detailSession.origin), { headers: { cookie: detailSession.cookie } });
+	assert.equal(detailPage.status, 200);
+	const workingHtml = await detailPage.text();
+	assert.match(workingHtml, /Show the report/);
+	assert.ok(workingHtml.includes(`data:image/png;base64,${recordedImage}`), "Real persisted Pi results must retain bounded inline image bytes.");
+	assert.match(detailPage.headers.get("content-security-policy"), /img-src data:/);
+	assert.doesNotMatch(detailSession.html, /data-recorded-src=/);
+	assert.doesNotMatch(detailSession.html, /Show the report/);
+	await command("/preview-browser --stop --responses");
+	assert.equal(await waitFor(() => isClosed(detailSession), "details watcher shutdown"), true);
+
+	const limitFiles = [];
+	for (let index = 0; index < 9; index++) {
+		const path = join(root, `limit-${index + 1}.md`);
+		await writeFile(path, `# Limit ${index + 1}\n`);
+		limitFiles.push(path);
+	}
+	const opensBeforeLimit = (await openedUrls()).length;
+	for (const path of limitFiles) await command(`/preview-browser -w --file ${JSON.stringify(path)}`);
+	const limitUrls = await waitOpenCount(opensBeforeLimit + 8);
+	assert.equal(limitUrls.length, opensBeforeLimit + 8, "The ninth watcher must not open a browser.");
+	assert.ok(notifications.some((event) => event.notifyType === "error" && event.message.includes("At most 8 browser preview watchers")));
+	const limitSessions = await Promise.all(limitUrls.slice(-8).map(bootstrap));
+	await command("/preview-browser --stop --all");
+	await waitFor(async () => (await Promise.all(limitSessions.map(isClosed))).every(Boolean), "stop-all shutdown");
+
+	const beforeEmptyList = notifications.length;
+	await command("/preview-browser --list");
+	assert.ok(notifications.slice(beforeEmptyList).some((event) => event.message === "No browser preview watchers are running."));
+
+	const raceFile = join(root, "race.md");
+	await writeFile(raceFile, "# Stop-during-start race\n");
+	await writeFile(pandocDelayFile, "delay");
+	const opensBeforeRace = (await openedUrls()).length;
+	let staleStartSettledAt = 0;
+	const staleStart = sendCommand(`/preview-browser -w --file ${JSON.stringify(raceFile)}`).finally(() => {
+		staleStartSettledAt = Date.now();
+	});
+	await new Promise((resolvePromise) => setTimeout(resolvePromise, 80));
+	const stopIssuedAt = Date.now();
+	const targetedStop = sendCommand(`/preview-browser --stop --file ${JSON.stringify(raceFile)}`);
+	await new Promise((resolvePromise) => setTimeout(resolvePromise, 20));
+	const replacementStart = sendCommand(`/preview-browser -w --file ${JSON.stringify(raceFile)}`);
+	await Promise.all([staleStart, targetedStop, replacementStart]);
+	assert.ok(staleStartSettledAt - stopIssuedAt < 450, "Stopping a provisional watcher should cancel its in-flight Pandoc render rather than waiting for it.");
+	await rm(pandocDelayFile, { force: true });
+	await waitOpenCount(opensBeforeRace + 1);
+	await new Promise((resolvePromise) => setTimeout(resolvePromise, 700));
+	assert.equal((await openedUrls()).length, opensBeforeRace + 1, "A stopped provisional start must not open or delete its replacement watcher.");
+	const beforeRaceList = notifications.length;
+	await command("/preview-browser --list");
+	assert.ok(notifications.slice(beforeRaceList).some((event) => /Browser preview watchers \(1\/8\)/.test(event.message)));
+	await command("/preview-browser --stop --all");
+
+	// --history 0 starts with only the latest response; repeating it on a running watcher explains that it applies at start.
+	const opensBeforeNoHistory = (await openedUrls()).length;
+	await command("/preview-browser -w --history 0");
+	const noHistorySession = await bootstrap((await waitOpenCount(opensBeforeNoHistory + 1)).at(-1));
+	assert.equal(revisionOf(noHistorySession.html), 1);
+	assert.match(noHistorySession.html, /data-watch-control="count"[^>]*>1\/1</);
+	const beforeRepeatHistory = notifications.length;
+	await command("/preview-browser -w --history 5");
+	assert.ok(notifications.slice(beforeRepeatHistory).some(e => e.message?.includes("--history applies when a watcher starts")), "A running watcher keeps its history and says so.");
+	assert.equal(revisionOf(await getPage(noHistorySession)), 1);
+	await command("/preview-browser --stop --responses");
+	assert.equal(await waitFor(() => isClosed(noHistorySession), "no-history watcher shutdown"), true);
+
+	// HTML input is a real isolated page, even without spelling --watch.
+	const htmlFile = join(root, "dashboard.html");
+	await writeFile(htmlFile, '<!doctype html><html><body><h1>HTML dashboard</h1><script>window.authoredPage=true;</script></body></html>');
+	const beforeHtml = (await openedUrls()).length;
+	await command(`/preview-browser ${JSON.stringify(htmlFile)}`);
+	const htmlUrls = await waitOpenCount(beforeHtml + 1);
+	const htmlSession = await bootstrap(htmlUrls.at(-1));
+	const iframeUrl = htmlSession.html.match(/<iframe[^>]*src="([^"]+)"/)[1].replaceAll("&amp;", "&");
+	assert.notEqual(new URL(iframeUrl).origin, htmlSession.origin);
+	assert.doesNotMatch(htmlSession.html, /<script>window.authoredPage/);
+	const authored = await fetch(iframeUrl);
+	assert.match(authored.headers.get("content-security-policy"), /sandbox allow-scripts/);
+	assert.doesNotMatch(authored.headers.get("content-security-policy"), /allow-same-origin/);
+	assert.match(await authored.text(), /<h1>HTML dashboard<\/h1>/);
+	await writeFile(htmlFile, '<!doctype html><html><body><h1>Updated dashboard</h1></body></html>');
+	await waitFor(async () => /Updated dashboard/.test(await getPage(htmlSession)), "HTML file refresh");
+	await command(`/preview-browser --stop --file ${JSON.stringify(htmlFile)}`);
+	await waitFor(() => isClosed(htmlSession), "HTML watch shutdown");
+	await assert.rejects(fetch(iframeUrl));
+
+	console.log(`Multi-watch RPC lifecycle checks passed (${notifications.length} notifications, ${(await openedUrls()).length} opens).`);
+} finally {
+	child.stdin.end();
+	if (child.exitCode === null) {
+		const force = setTimeout(() => child.kill("SIGKILL"), 5000);
+		try { await new Promise((resolvePromise) => child.once("exit", resolvePromise)); } finally { clearTimeout(force); }
+	}
+	await rm(root, { recursive: true, force: true });
+}

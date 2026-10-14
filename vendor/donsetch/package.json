@@ -1,0 +1,66 @@
+{
+  "name": "donsetch",
+  "version": "4.8.0",
+  "description": "MCP server that gives AI agents the web: fetch, search, crawl and screenshot from one local Rust binary. Zero API keys, zero accounts, Chrome-true TLS.",
+  "license": "AGPL-3.0-only",
+  "author": "Bishesh Bhandari",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/dondai44423/donsetch"
+  },
+  "homepage": "https://github.com/dondai44423/donsetch#readme",
+  "funding": {
+    "type": "individual",
+    "url": "https://ko-fi.com/G5Y624N5RE"
+  },
+  "bugs": {
+    "url": "https://github.com/dondai44423/donsetch/issues"
+  },
+  "keywords": [
+    "pi-package",
+    "mcp",
+    "mcp-server",
+    "model-context-protocol",
+    "ai-agent",
+    "agent-tools",
+    "web-fetch",
+    "web-search",
+    "web-scraping",
+    "web-crawler",
+    "web-research",
+    "screenshot",
+    "markdown",
+    "pdf",
+    "ocr",
+    "extraction",
+    "anti-bot",
+    "tls",
+    "chrome",
+    "stealth",
+    "no-api-key",
+    "claude",
+    "cursor",
+    "rust"
+  ],
+  "pi": {
+    "extensions": ["./pi-extension.ts"]
+  },
+  "bin": {
+    "donsetch": "bin/donsetch.js"
+  },
+  "scripts": {
+    "postinstall": "node install.js",
+    "test": "node --test --test-timeout=90000 tests/*.test.js"
+  },
+  "files": [
+    "install.js",
+    "resolve-binary.js",
+    "bin/donsetch.js",
+    "pi-extension.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  }
+}

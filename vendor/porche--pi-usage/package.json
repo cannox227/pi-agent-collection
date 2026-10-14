@@ -1,0 +1,34 @@
+{
+  "name": "@porche/pi-usage",
+  "version": "0.3.5",
+  "description": "Pi Coding Agent extension for tracking session token usage, provider account limits, and historical local consumption.",
+  "license": "MIT",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi-coding-agent",
+    "pi",
+    "usage",
+    "codex",
+    "anthropic",
+    "openrouter"
+  ],
+  "author": "Porche",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/aporcelli/pi-usage.git"
+  },
+  "bugs": {
+    "url": "https://github.com/aporcelli/pi-usage/issues"
+  },
+  "homepage": "https://github.com/aporcelli/pi-usage#readme",
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ]
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "latest",
+    "typescript": "^5.0.0"
+  }
+}

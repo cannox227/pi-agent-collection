@@ -1,0 +1,58 @@
+{
+  "name": "pi-agent-collection",
+  "version": "0.1.0",
+  "private": true,
+  "keywords": [
+    "pi-package"
+  ],
+  "workspaces": [
+    "skills/pi-skills/brave-search",
+    "skills/pi-skills/browser-tools",
+    "skills/pi-skills/youtube-transcript",
+    "vendor/*"
+  ],
+  "dependencies": {
+    "@dietrichgebert/ponytail": "file:vendor/dietrichgebert--ponytail",
+    "pi-community-themes": "file:vendor/pi-community-themes",
+    "donsetch": "file:vendor/donsetch",
+    "pi": "file:vendor/pi",
+    "pi-subagents": "file:vendor/pi-subagents",
+    "@porche/pi-usage": "file:vendor/porche--pi-usage",
+    "@sttronn/pi-sheets": "file:vendor/sttronn--pi-sheets",
+    "pi-markdown-preview": "file:vendor/pi-markdown-preview",
+    "superpowers": "file:vendor/superpowers",
+    "pi-ssh-remote": "file:vendor/pi-ssh-remote",
+    "@tmustier/pi-usage-extension": "file:vendor/tmustier--pi-usage-extension"
+  },
+  "pi": {
+    "skills": [
+      "./skills",
+      "./vendor/dietrichgebert--ponytail/skills",
+      "./vendor/pi/skills",
+      "./vendor/pi-subagents/skills",
+      "./vendor/sttronn--pi-sheets/skills",
+      "./vendor/superpowers/skills"
+    ],
+    "extensions": [
+      "./extensions",
+      "./vendor/dietrichgebert--ponytail/pi-extension/index.js",
+      "./vendor/donsetch/pi-extension.ts",
+      "./vendor/pi/extensions",
+      "./vendor/pi-subagents/index.js",
+      "./vendor/porche--pi-usage/extensions",
+      "./vendor/sttronn--pi-sheets/src/index.ts",
+      "./vendor/pi-markdown-preview/index.ts",
+      "./vendor/superpowers/.pi/extensions/superpowers.ts",
+      "./vendor/pi-ssh-remote/index.ts",
+      "./vendor/tmustier--pi-usage-extension/index.ts"
+    ],
+    "prompts": [
+      "./prompts",
+      "./vendor/pi-subagents/prompts"
+    ],
+    "themes": [
+      "./themes",
+      "./vendor/pi-community-themes/themes"
+    ]
+  }
+}
